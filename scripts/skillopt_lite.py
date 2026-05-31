@@ -240,6 +240,20 @@ def load_state(path: Path) -> dict:
         return {"index": 0, "runs": [], "state_error": "invalid json replaced"}
 
 
+def available_targets(targets: list[str], roots: list[Path]) -> tuple[list[str], list[str]]:
+    """Return targets resolvable in this profile/install plus skipped names."""
+    available: list[str] = []
+    skipped: list[str] = []
+    for target in targets:
+        try:
+            resolve_skill(target, roots)
+        except SystemExit:
+            skipped.append(target)
+        else:
+            available.append(target)
+    return available, skipped
+
+
 def choose_target(targets: list[str], state_path: Path) -> tuple[str, dict]:
     state = load_state(state_path)
     idx = int(state.get("index", 0)) % len(targets)
@@ -288,6 +302,22 @@ def main() -> None:
     roots = skill_roots(args.skills_root)
     run_root = Path(args.run_root).expanduser()
     state_path = Path(args.state).expanduser() if args.state else run_root / "skillopt-lite-state.json"
+    targets, skipped_targets = available_targets(targets, roots)
+    if not targets:
+        run_root.mkdir(parents=True, exist_ok=True)
+        append_jsonl(run_root / "skillopt-lite-ledger.jsonl", {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "decision": "NO_TARGETS",
+            "skipped_targets": skipped_targets,
+            "mode": "detector-ledger",
+            "eval": "static-heuristic",
+        })
+        summary = {"decision": "NO_TARGETS", "skipped_targets": skipped_targets, "mode": "detector-ledger"}
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False))
+        else:
+            print("NO_TARGETS")
+        return
 
     if args.cmd == "init-code-review":
         targets = ["github-code-review"]
