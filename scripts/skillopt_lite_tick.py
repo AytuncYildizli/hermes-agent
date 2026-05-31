@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Cron wrapper for scripts/skillopt_lite.py.
 
-No-agent cron semantics: empty stdout is silent. Print only when a candidate is
-accepted, a regression/blocker appears, or the run cannot complete.
+No-agent cron semantics: empty stdout is silent. This cron is a detector/ledger,
+not a production patcher. Print only when a blocker/regression appears or when a
+static signal is worth human review.
 """
 from __future__ import annotations
 
@@ -56,20 +57,22 @@ if score_path.exists():
 
 base = next((r for r in score_rows if r.get("artifact") == "base_skill.md"), {})
 cand = next((r for r in score_rows if r.get("artifact") == "candidate_skill.md"), {})
-accepted = summary.get("decision") == "ACCEPT"
+signal = summary.get("decision") == "SIGNAL"
 regressed = cand.get("score", 0) < base.get("score", 0)
 
-# Stay silent for clean no-op rejections. This is the normal continuous mode.
-if not accepted and not regressed:
+# Stay silent for clean no-signal ticks. This is the normal continuous mode.
+if not signal and not regressed:
     sys.exit(0)
 
 print(json.dumps({
-    "status": "GREEN" if accepted else "YELLOW",
-    "summary": "skillopt-lite continuous tick",
+    "status": "SIGNAL" if signal else "YELLOW",
+    "summary": "skillopt-lite detector tick",
     "target": summary.get("target"),
     "decision": summary.get("decision"),
     "base": {"score": base.get("score"), "max": base.get("max")},
     "candidate": {"score": cand.get("score"), "max": cand.get("max")},
     "artifact": str(artifact),
+    "mode": "detector-ledger",
+    "note": "static heuristic signal only; fixture-based behavioral eval is v2",
     "report_head": "\n".join(report.splitlines()[:8]),
 }, ensure_ascii=False))

@@ -63,6 +63,10 @@ def test_continuous_tick_rotates_targets_and_writes_artifacts(tmp_path):
     data = json.loads(state.read_text())
     assert data["index"] == 0
     assert [r["target"] for r in data["runs"]] == ["alpha", "beta"]
+    ledger = [json.loads(line) for line in (run_root / "skillopt-lite-ledger.jsonl").read_text().splitlines()]
+    assert [r["target"] for r in ledger] == ["alpha", "beta"]
+    assert {r["mode"] for r in ledger} == {"detector-ledger"}
+    assert {r["eval"] for r in ledger} == {"static-heuristic"}
     for run_dir in [run_a, run_b]:
         assert (run_dir / "base_skill.md").exists()
         assert (run_dir / "candidate_skill.md").exists()
@@ -101,5 +105,5 @@ Side effects require approval before send/delete/pay.
     rejected = (run_dir / "rejected_edits.jsonl").read_text()
 
     assert "Base: 8/8" in report
-    assert "Decision: REJECT" in report
-    assert "no validation improvement" in rejected
+    assert "Decision: NO_SIGNAL" in report
+    assert "no static heuristic signal" in rejected

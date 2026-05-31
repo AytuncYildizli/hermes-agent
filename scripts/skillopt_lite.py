@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""SkillOpt-lite: validation-gated optimizer scaffold for Hermes SKILL.md files.
+"""SkillOpt-lite detector/ledger for Hermes SKILL.md improvement signals.
 
-This is intentionally conservative: it never mutates production skills. Each run
-selects one target skill, writes an artifact bundle under ``~/hermes-workspace``
-or ``$SKILLOPT_RUN_ROOT``, scores base vs candidate, and exports ``best_skill.md``
-only when the bounded candidate improves validation checks.
+This is intentionally conservative: it never mutates production skills and does
+not claim real behavioral evaluation. Each run selects one target skill, writes an
+artifact bundle under ``~/hermes-workspace`` or ``$SKILLOPT_RUN_ROOT``, records a
+static heuristic signal, and leaves any candidate as a review artifact only.
+Fixture-based behavioral eval belongs to SkillOpt v2.
 """
 from __future__ import annotations
 
@@ -125,6 +126,12 @@ def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
 
 
+def append_jsonl(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def resolve_skill(name: str, roots: Iterable[Path]) -> Path:
     candidates: list[Path] = []
     frontmatter_name = re.compile(rf"^name:\s*['\"]?{re.escape(name)}['\"]?\s*$", re.M)
@@ -176,20 +183,21 @@ def run_once(skill_name: str, *, roots: list[Path], run_root: Path) -> Path:
     candidate, patch = propose_candidate(skill_name, base)
     base_score = score_skill(base)
     cand_score = score_skill(candidate)
-    accepted = bool(patch) and cand_score.total > base_score.total
+    signal = bool(patch) and cand_score.total > base_score.total
 
     (run_dir / "base_skill.md").write_text(base, encoding="utf-8")
     (run_dir / "candidate_skill.md").write_text(candidate, encoding="utf-8")
-    (run_dir / "best_skill.md").write_text(candidate if accepted else base, encoding="utf-8")
+    # Review artifact only. This is not a production patch output.
+    (run_dir / "best_skill.md").write_text(candidate if signal else base, encoding="utf-8")
     (run_dir / "source_path.txt").write_text(str(skill_path) + "\n", encoding="utf-8")
     write_jsonl(run_dir / "candidate_edits.jsonl", patch)
     write_jsonl(run_dir / "scores.jsonl", [
         {"artifact": "base_skill.md", "score": base_score.total, "max": base_score.max_total, "hits": base_score.hits},
         {"artifact": "candidate_skill.md", "score": cand_score.total, "max": cand_score.max_total, "hits": cand_score.hits},
     ])
-    write_jsonl(run_dir / "rejected_edits.jsonl", [] if accepted else [{
+    write_jsonl(run_dir / "rejected_edits.jsonl", [] if signal else [{
         "patch": patch,
-        "reason": "no validation improvement",
+        "reason": "no static heuristic signal",
         "base": base_score.total,
         "candidate": cand_score.total,
     }])
@@ -201,7 +209,9 @@ def run_once(skill_name: str, *, roots: list[Path], run_root: Path) -> Path:
         f"Source: {skill_path}",
         f"Base: {base_score.total}/{base_score.max_total}",
         f"Candidate: {cand_score.total}/{cand_score.max_total}",
-        f"Decision: {'ACCEPT' if accepted else 'REJECT'}",
+        f"Decision: {'SIGNAL' if signal else 'NO_SIGNAL'}",
+        "Mode: detector/ledger only; candidate artifacts are not production patches.",
+        "Eval: static heuristic only; v2 must use fixture-based behavioral eval.",
         "",
         "## Candidate edit budget",
         f"Edits: {len(patch)}",
@@ -244,11 +254,24 @@ def update_state(state_path: Path, state: dict, targets: list[str], target: str,
     state["runs"] = runs
     state_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(state_path, state)
+    append_jsonl(state_path.parent / "skillopt-lite-ledger.jsonl", {
+        "ts": state["updated_at"],
+        "target": target,
+        "decision": decision,
+        "artifact": str(run_dir),
+        "mode": "detector-ledger",
+        "eval": "static-heuristic",
+    })
 
 
 def decision_from_report(run_dir: Path) -> str:
     report = read_text(run_dir / "report.md") if (run_dir / "report.md").exists() else ""
-    return "ACCEPT" if "Decision: ACCEPT" in report else "REJECT" if "Decision: REJECT" in report else "UNKNOWN"
+    if "Decision: SIGNAL" in report:
+        return "SIGNAL"
+    if "Decision: NO_SIGNAL" in report:
+        return "NO_SIGNAL"
+    # Backward compatibility for old artifacts.
+    return "SIGNAL" if "Decision: ACCEPT" in report else "NO_SIGNAL" if "Decision: REJECT" in report else "UNKNOWN"
 
 
 def main() -> None:
@@ -280,7 +303,7 @@ def main() -> None:
     decision = decision_from_report(run_dir)
     update_state(state_path, state, targets, target, run_dir, decision)
 
-    summary = {"target": target, "decision": decision, "artifact": str(run_dir)}
+    summary = {"target": target, "decision": decision, "artifact": str(run_dir), "mode": "detector-ledger"}
     if args.json:
         print(json.dumps(summary, ensure_ascii=False))
     else:
