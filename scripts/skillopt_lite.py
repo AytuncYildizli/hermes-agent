@@ -18,11 +18,11 @@ from pathlib import Path
 from typing import Iterable
 
 DEFAULT_TARGETS = [
-    "code-review",
+    "github-code-review",
     "systematic-debugging",
-    "x-bookmark-browser-patrol",
+    "github-pr-workflow",
     "hermes-agent",
-    "executive-assistant",
+    "research-paper-writing",
 ]
 
 CHECKS = {
@@ -48,7 +48,7 @@ GENERIC_PATCH = """
 """.strip()
 
 TARGET_PATCHES = {
-    "code-review": """
+    "github-code-review": """
 ### Evidence discipline for review findings
 
 - Every Must Fix finding should cite concrete file/line evidence when available.
@@ -267,8 +267,8 @@ def main() -> None:
     state_path = Path(args.state).expanduser() if args.state else run_root / "skillopt-lite-state.json"
 
     if args.cmd == "init-code-review":
-        targets = ["code-review"]
-        target = "code-review"
+        targets = ["github-code-review"]
+        target = "github-code-review"
         state = load_state(state_path)
     elif args.cmd == "run":
         target = targets[0]

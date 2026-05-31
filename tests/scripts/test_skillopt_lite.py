@@ -24,6 +24,21 @@ def write_skill(root: Path, name: str, body: str) -> Path:
     return path
 
 
+def test_default_targets_exist_in_repo_skills():
+    repo = Path(__file__).resolve().parents[2]
+    mod = load_module(repo)
+    roots = [repo / "skills"]
+
+    missing = []
+    for target in mod.DEFAULT_TARGETS:
+        try:
+            mod.resolve_skill(target, roots)
+        except SystemExit:
+            missing.append(target)
+
+    assert missing == []
+
+
 def test_continuous_tick_rotates_targets_and_writes_artifacts(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     mod = load_module(repo)
