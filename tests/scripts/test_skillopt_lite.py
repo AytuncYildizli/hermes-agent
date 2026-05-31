@@ -70,6 +70,15 @@ def test_continuous_tick_rotates_targets_and_writes_artifacts(tmp_path):
         assert (run_dir / "report.md").exists()
 
 
+def test_tick_wrapper_has_no_developer_local_fallback_path():
+    repo = Path(__file__).resolve().parents[2]
+    wrapper = (repo / "scripts" / "skillopt_lite_tick.py").read_text(encoding="utf-8")
+
+    assert "/Users/" not in wrapper
+    assert "SKILLOPT_LITE_SCRIPT" in wrapper
+    assert "HERMES_HOME" in wrapper
+
+
 def test_candidate_is_rejected_when_skill_already_scores_full(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     mod = load_module(repo)

@@ -7,14 +7,33 @@ accepted, a regression/blocker appears, or the run cannot complete.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
 
-REPO_SCRIPT = pathlib.Path(__file__).with_name("skillopt_lite.py")
-if not REPO_SCRIPT.exists():
-    # Local deployment fallback used by profile cron wrappers.
-    REPO_SCRIPT = pathlib.Path("/Users/aytuncyildizli/hermes-workspace/hermes-skillopt-continuous/scripts/skillopt_lite.py")
+
+def resolve_skillopt_script() -> pathlib.Path:
+    """Find the SkillOpt-lite runner without embedding developer-local paths."""
+    candidates: list[pathlib.Path] = []
+    env_script = os.environ.get("SKILLOPT_LITE_SCRIPT")
+    if env_script:
+        candidates.append(pathlib.Path(env_script).expanduser())
+    candidates.append(pathlib.Path(__file__).with_name("skillopt_lite.py"))
+    hermes_home = pathlib.Path(os.environ.get("HERMES_HOME", pathlib.Path.home() / ".hermes")).expanduser()
+    candidates.append(hermes_home / "scripts" / "skillopt_lite.py")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("skillopt_lite.py not found; set SKILLOPT_LITE_SCRIPT or install it under HERMES_HOME/scripts")
+
+
+try:
+    REPO_SCRIPT = resolve_skillopt_script()
+except FileNotFoundError as exc:
+    print(json.dumps({"status": "RED", "error": str(exc)}, ensure_ascii=False))
+    sys.exit(1)
 
 cmd = ["python3", str(REPO_SCRIPT), "continuous-tick", "--json"]
 proc = subprocess.run(cmd, text=True, capture_output=True, timeout=240)
