@@ -39,6 +39,28 @@ def test_default_targets_exist_in_repo_skills():
     assert missing == []
 
 
+def test_missing_default_targets_are_skipped_instead_of_failing(tmp_path):
+    repo = Path(__file__).resolve().parents[2]
+    mod = load_module(repo)
+    skills = tmp_path / "skills"
+    run_root = tmp_path / "runs"
+    state = run_root / "state.json"
+    write_skill(skills, "present", "Use when asked. Steps: inspect then answer. Output: short.")
+
+    available, skipped = mod.available_targets(["missing", "present"], [skills])
+    assert available == ["present"]
+    assert skipped == ["missing"]
+
+    target, loaded_state = mod.choose_target(available, state)
+    run_dir = mod.run_once(target, roots=[skills], run_root=run_root)
+    decision = mod.decision_from_report(run_dir)
+    mod.update_state(state, loaded_state, available, target, run_dir, decision)
+
+    data = json.loads(state.read_text())
+    assert data["targets"] == ["present"]
+    assert data["runs"][0]["target"] == "present"
+
+
 def test_continuous_tick_rotates_targets_and_writes_artifacts(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     mod = load_module(repo)

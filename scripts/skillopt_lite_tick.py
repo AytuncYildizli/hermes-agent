@@ -48,6 +48,11 @@ except Exception as exc:
     print(json.dumps({"status": "RED", "error": f"invalid skillopt output: {exc}", "stdout": proc.stdout[-500:]}, ensure_ascii=False))
     sys.exit(1)
 
+if summary.get("decision") == "NO_TARGETS":
+    # Installed profile has none of the configured targets. Ledger already has
+    # the no-targets row; cron stays quiet instead of spamming RED.
+    sys.exit(0)
+
 artifact = pathlib.Path(summary["artifact"])
 report = (artifact / "report.md").read_text(errors="ignore") if (artifact / "report.md").exists() else ""
 score_rows = []
