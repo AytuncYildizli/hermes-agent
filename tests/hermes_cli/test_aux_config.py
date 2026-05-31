@@ -42,12 +42,10 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
 
 
-def test_session_search_defaults_include_extra_body_and_concurrency():
-    ss = DEFAULT_CONFIG["auxiliary"]["session_search"]
-    assert ss["provider"] == "auto"
-    assert ss["model"] == ""
-    assert ss["extra_body"] == {}
-    assert ss["max_concurrency"] == 3
+def test_session_search_removed_from_auxiliary_defaults_and_menu():
+    """session_search is DB-backed and should not appear as an aux LLM task."""
+    assert "session_search" not in DEFAULT_CONFIG["auxiliary"]
+    assert "session_search" not in {key for key, _name, _desc in _AUX_TASKS}
 
 
 def test_aux_tasks_keys_all_exist_in_default_config():

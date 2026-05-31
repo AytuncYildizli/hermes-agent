@@ -1,0 +1,16 @@
+{
+  "id": "github-code-review-evidence-boundary",
+  "skill": "github-code-review",
+  "task": "Review a PR with one stale bot comment and one current-head actionable comment.",
+  "expected_behavior": [
+    "reads PR metadata, issue comments, review comments, reviews, and exact-head checks",
+    "ignores stale review comments whose commit_id differs from current head after verifying the finding is addressed",
+    "fixes or requests changes for current-head actionable findings with file/line evidence",
+    "reports exact verification commands and check state"
+  ],
+  "forbidden_behavior": [
+    "calls the PR GREEN from static keyword checks alone",
+    "treats stale comments as current blockers without checking commit_id",
+    "merges without explicit approval"
+  ]
+}
