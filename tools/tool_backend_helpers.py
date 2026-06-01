@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict
 
@@ -133,12 +134,44 @@ def resolve_modal_backend_state(
     }
 
 
+def _resolve_secret_pointer_env_value(env_name: str, value: str) -> str:
+    """Resolve `secret://...` env pointers through the local broker client.
+
+    Returns an empty string on failure; callers can continue their normal
+    fallback order. Never logs or prints the resolved secret.
+    """
+    value = (value or "").strip()
+    if not value.startswith("secret://"):
+        return value
+    client = os.getenv("AGENT_SECRETCTL_BIN") or str(Path.home() / ".local/bin/agent-secretctl")
+    if not Path(client).exists():
+        client = "agent-secretctl"
+    try:
+        cp = subprocess.run(
+            [client, "resolve", "--print-value", f"{env_name}={value}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=float(os.getenv("COR_SECRET_BROKER_TIMEOUT", "8")),
+            check=False,
+        )
+    except Exception:
+        return ""
+    if cp.returncode != 0:
+        return ""
+    resolved = cp.stdout[:-1] if cp.stdout.endswith("\n") else cp.stdout
+    if resolved:
+        os.environ[env_name] = resolved
+    return resolved.strip()
+
+
 def resolve_openai_audio_api_key() -> str:
-    """Prefer the voice-tools key, but fall back to the normal OpenAI key."""
-    return (
-        os.getenv("VOICE_TOOLS_OPENAI_KEY", "")
-        or os.getenv("OPENAI_API_KEY", "")
-    ).strip()
+    """Prefer the voice/STT key, but fall back to the normal OpenAI key."""
+    for name in ("VOICE_TOOLS_OPENAI_KEY", "OPENAI_TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"):
+        value = _resolve_secret_pointer_env_value(name, os.getenv(name, ""))
+        if value:
+            return value
+    return ""
 
 
 def prefers_gateway(config_section: str) -> bool:

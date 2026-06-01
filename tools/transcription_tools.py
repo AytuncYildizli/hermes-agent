@@ -44,6 +44,20 @@ from tools.tool_backend_helpers import (
     resolve_openai_audio_api_key,
 )
 
+try:
+    from tools.tool_backend_helpers import _resolve_secret_pointer_env_value
+except ImportError:
+    def _resolve_secret_pointer_env_value(env_name: str, value: str) -> str:
+        """Fallback for long-lived gateways with stale cached helper modules.
+
+        If the helper module was imported before a Hermes source update, it may
+        lack this private helper even though the file on disk has it. Avoid
+        crashing voice/STT import; unresolved secret pointers simply fall back
+        through the normal provider/key order.
+        """
+        value = (value or "").strip()
+        return "" if value.startswith("secret://") else value
+
 logger = logging.getLogger(__name__)
 
 def get_env_value(name, default=None):
@@ -58,6 +72,8 @@ def get_env_value(name, default=None):
     except ImportError:
         return os.getenv(name, default)
     value = _get_env_value(name)
+    if isinstance(value, str) and value.startswith("secret://"):
+        value = _resolve_secret_pointer_env_value(name, value)
     return default if value is None else value
 
 # ---------------------------------------------------------------------------
@@ -1638,7 +1654,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
     """Return direct OpenAI audio config or a managed gateway fallback."""
     stt_config = _load_stt_config()
     openai_cfg = stt_config.get("openai", {})
-    cfg_api_key = openai_cfg.get("api_key", "")
+    cfg_api_key = _resolve_secret_pointer_env_value("STT_OPENAI_API_KEY", str(openai_cfg.get("api_key", "") or ""))
     cfg_base_url = openai_cfg.get("base_url", "")
     if cfg_api_key:
         return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
