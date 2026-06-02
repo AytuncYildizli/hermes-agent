@@ -860,6 +860,45 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
     assert "access_token" not in persisted
 
 
+def test_load_pool_uses_resolved_secret_pointer_env_value(tmp_path, monkeypatch):
+    """A broker pointer in .env must not be seeded as the runtime credential.
+
+    load_hermes_dotenv() resolves `secret://...` into os.environ, while the
+    .env file intentionally keeps only the pointer. The credential pool prefers
+    .env over inherited shell values, but for pointers it must use the resolved
+    process value or the lane sends `secret://...` to the provider.
+    """
+    sentinel = "sk-c-RESOLVED-BROKER-SECRET"
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MINIMAX_API_KEY", sentinel)
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.get_secret_source",
+        lambda env_var: "cor-broker" if env_var == "MINIMAX_API_KEY" else None,
+    )
+    (hermes_home / ".env").write_text(
+        "MINIMAX_API_KEY=secret://env/minimax-api-key\n"
+    )
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("minimax")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.source == "env:MINIMAX_API_KEY"
+    assert entry.access_token == sentinel
+
+    auth_text = (hermes_home / "auth.json").read_text()
+    assert sentinel not in auth_text
+    assert "secret://env/minimax-api-key" not in auth_text
+    persisted = json.loads(auth_text)["credential_pool"]["minimax"][0]
+    assert persisted["secret_source"] == "cor-broker"
+    assert "access_token" not in persisted
+
+
 
 def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_path, monkeypatch):
     """Existing raw env-seeded pool entries are rewritten even if the env value matches."""

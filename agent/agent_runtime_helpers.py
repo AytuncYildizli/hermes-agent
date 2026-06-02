@@ -1080,17 +1080,47 @@ def dump_api_request_debug(
         except Exception as e:
             _ra().logger.debug("Could not extract API key for debug dump: %s", e)
 
+        base_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
+        if agent.api_mode == "codex_responses":
+            request_url = f"{base_url}/responses"
+            request_headers = {
+                "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                "Content-Type": "application/json",
+            }
+        elif agent.api_mode == "anthropic_messages":
+            anthropic_base = base_url
+            if anthropic_base.endswith("/v1"):
+                request_url = f"{anthropic_base}/messages"
+            else:
+                request_url = f"{anthropic_base}/v1/messages"
+            masked_key = agent._mask_api_key_for_logs(
+                getattr(agent, "_anthropic_api_key", None) or api_key
+            )
+            if getattr(agent, "provider", "") in {"anthropic", "minimax-oauth"} and getattr(agent, "_is_anthropic_oauth", False):
+                request_headers = {
+                    "Authorization": f"Bearer {masked_key}",
+                    "Content-Type": "application/json",
+                }
+            else:
+                request_headers = {
+                    "X-Api-Key": masked_key,
+                    "Content-Type": "application/json",
+                }
+        else:
+            request_url = f"{base_url}/chat/completions"
+            request_headers = {
+                "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                "Content-Type": "application/json",
+            }
+
         dump_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "session_id": agent.session_id,
             "reason": reason,
             "request": {
                 "method": "POST",
-                "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
-                "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
-                    "Content-Type": "application/json",
-                },
+                "url": request_url,
+                "headers": request_headers,
                 "body": body,
             },
         }

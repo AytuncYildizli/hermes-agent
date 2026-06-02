@@ -145,15 +145,15 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
-    def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
+    def test_minimax_anthropic_endpoint_uses_x_api_key_for_regular_api_keys(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(
                 "minimax-secret-123",
                 base_url="https://api.minimax.io/anthropic",
             )
             kwargs = mock_sdk.Anthropic.call_args[1]
-            assert kwargs["auth_token"] == "minimax-secret-123"
-            assert "api_key" not in kwargs
+            assert kwargs["api_key"] == "minimax-secret-123"
+            assert "auth_token" not in kwargs
             assert kwargs["default_headers"] == {
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
@@ -165,8 +165,8 @@ class TestBuildAnthropicClient:
                 base_url="https://api.minimaxi.com/anthropic",
             )
             kwargs = mock_sdk.Anthropic.call_args[1]
-            assert kwargs["auth_token"] == "minimax-cn-secret-123"
-            assert "api_key" not in kwargs
+            assert kwargs["api_key"] == "minimax-cn-secret-123"
+            assert "auth_token" not in kwargs
             assert kwargs["default_headers"] == {
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }

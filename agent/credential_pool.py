@@ -1950,7 +1950,11 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = env_file.get(key) or os.environ.get(key) or ""
+        dotenv_val = str(env_file.get(key) or "").strip()
+        process_val = str(os.environ.get(key) or "").strip()
+        if dotenv_val.startswith("secret://") and process_val and not process_val.startswith("secret://"):
+            return process_val
+        val = dotenv_val or process_val or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an

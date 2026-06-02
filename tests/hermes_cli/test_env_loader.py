@@ -2,6 +2,7 @@ import importlib
 import os
 import sys
 
+from hermes_cli import env_loader
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
@@ -84,6 +85,38 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert loaded == [env_file]
     assert os.getenv("GLM_API_KEY") == "abc"
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
+
+
+def test_secret_pointer_in_user_env_resolves_via_cor_broker(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text(
+        "MINIMAX_API_KEY=secret://env/minimax-api-key\n",
+        encoding="utf-8",
+    )
+    secretctl = tmp_path / "agent-secretctl"
+    secretctl.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"resolve\" ] && [ \"$2\" = \"--print-value\" ]; then\n"
+        "  printf 'sk-c-resolved-minimax-key'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    secretctl.chmod(0o700)
+
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.setenv("AGENT_SECRETCTL_BIN", str(secretctl))
+    monkeypatch.setenv("COR_SECRET_BROKER_TIMEOUT", "2")
+    env_loader._SECRET_SOURCES.clear()
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [env_file]
+    assert os.getenv("MINIMAX_API_KEY") == "sk-c-resolved-minimax-key"
+    assert env_loader.get_secret_source("MINIMAX_API_KEY") == "cor-broker"
 
 
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):

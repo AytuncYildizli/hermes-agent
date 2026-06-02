@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import subprocess
 
 from dotenv import load_dotenv
 from utils import atomic_replace
@@ -120,6 +121,10 @@ def _sanitize_loaded_credentials() -> None:
         except UnicodeEncodeError:
             pass
         cleaned = value.encode("ascii", errors="ignore").decode("ascii")
+        # Do not strip broker pointers. They are metadata, not the actual
+        # credential; resolving happens immediately after dotenv load.
+        if value.startswith("secret://"):
+            continue
         os.environ[key] = cleaned
         if key in _WARNED_KEYS:
             continue
@@ -209,6 +214,69 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _resolve_cor_broker_secret_pointers() -> None:
+    """Resolve env values of the form ``secret://...`` via local agent-secretctl.
+
+    The .env file keeps only broker pointers. The raw secret is requested from
+    the Mac mini broker and installed into this process environment without
+    printing it. Failures are warnings, not startup blockers.
+    """
+    mappings = [
+        (key, value)
+        for key, value in list(os.environ.items())
+        if isinstance(value, str) and value.startswith("secret://")
+    ]
+    if not mappings:
+        return
+
+    client = os.getenv("AGENT_SECRETCTL_BIN") or str(Path.home() / ".local/bin/agent-secretctl")
+    if not Path(client).exists():
+        client = "agent-secretctl"
+
+    applied = 0
+    for key, pointer in mappings:
+        try:
+            cp = subprocess.run(
+                [client, "resolve", "--print-value", f"{key}={pointer}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=float(os.getenv("COR_SECRET_BROKER_TIMEOUT", "8")),
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — secret source must not block startup
+            if key not in _WARNED_KEYS:
+                _WARNED_KEYS.add(key)
+                print(f"  Cor Secret Broker: failed to resolve {key}: {exc}", file=sys.stderr)
+            continue
+        if cp.returncode != 0:
+            if key not in _WARNED_KEYS:
+                _WARNED_KEYS.add(key)
+                detail = (cp.stderr or "resolve failed").strip().splitlines()[:1]
+                msg = detail[0] if detail else "resolve failed"
+                print(f"  Cor Secret Broker: failed to resolve {key}: {msg}", file=sys.stderr)
+            continue
+        # agent-secretctl resolve --print-value writes only the raw value to
+        # stdout. Preserve embedded newlines but drop the final print newline.
+        value = cp.stdout[:-1] if cp.stdout.endswith("\n") else cp.stdout
+        if not value:
+            if key not in _WARNED_KEYS:
+                _WARNED_KEYS.add(key)
+                print(f"  Cor Secret Broker: empty value for {key}", file=sys.stderr)
+            continue
+        os.environ[key] = value
+        _SECRET_SOURCES[key] = "cor-broker"
+        applied += 1
+
+    if applied:
+        _sanitize_loaded_credentials()
+        if os.getenv("COR_SECRET_BROKER_VERBOSE") == "1":
+            print(
+                f"  Cor Secret Broker: applied {applied} secret{'s' if applied != 1 else ''}",
+                file=sys.stderr,
+            )
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -236,10 +304,12 @@ def load_hermes_dotenv(
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
+        _resolve_cor_broker_secret_pointers()
         loaded.append(user_env)
 
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        _resolve_cor_broker_secret_pointers()
         loaded.append(project_env_path)
 
     _apply_external_secret_sources(home_path)

@@ -477,17 +477,13 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
-    MiniMax's global and China Anthropic-compatible endpoints, and Azure AI
-    Foundry's Anthropic-style endpoint follow this pattern.
+    Azure AI Foundry's Anthropic-style endpoint follows this pattern.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
         return False
     normalized = normalized.rstrip("/").lower()
-    return (
-        normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
-        or "azure.com" in normalized
-    )
+    return "azure.com" in normalized
 
 
 def _base_url_needs_context_1m_beta(base_url: str | None) -> bool:
@@ -502,7 +498,7 @@ def _is_minimax_anthropic_endpoint(base_url: str | None) -> bool:
     """Return True for MiniMax's Anthropic-compatible endpoints.
 
     MiniMax rejects the fine-grained-tool-streaming and context-1m betas;
-    those need to be stripped even though MiniMax also uses Bearer auth.
+    those need to be stripped while still using the SDK's x-api-key path.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -543,7 +539,7 @@ def _common_betas_for_base_url(
 ) -> list[str]:
     """Return the beta headers that are safe for the configured endpoint.
 
-    MiniMax's Anthropic-compatible endpoints (Bearer-auth) reject requests
+    MiniMax's Anthropic-compatible endpoints reject requests
     that include Anthropic's ``fine-grained-tool-streaming`` beta — every
     tool-use message triggers a connection error. They also reject the
     1M-context beta. Azure AI Foundry's Anthropic endpoint also uses
@@ -724,12 +720,9 @@ def build_anthropic_client(
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
     elif _requires_bearer_auth(normalized_base_url):
-        # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
+        # Some Anthropic-compatible providers expect the API key in
         # Authorization: Bearer *** for regular API keys. Route those endpoints
         # through auth_token so the SDK sends Bearer auth instead of x-api-key.
-        # Check this before OAuth token shape detection because MiniMax secrets do
-        # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
-        # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}

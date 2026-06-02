@@ -1811,6 +1811,34 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
 
 
+def test_dump_api_request_debug_uses_anthropic_messages_url(monkeypatch, tmp_path):
+    """Debug dumps should show /v1/messages URL for Anthropic Messages mode."""
+    import json
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="MiniMax-M3",
+        provider="minimax",
+        api_mode="anthropic_messages",
+        base_url="https://api.minimax.io/anthropic",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug(
+        {"model": "MiniMax-M3", "messages": [{"role": "user", "content": "hi"}]},
+        reason="preflight",
+    )
+
+    payload = json.loads(dump_file.read_text())
+    assert payload["request"]["url"] == "https://api.minimax.io/anthropic/v1/messages"
+    assert "Authorization" not in payload["request"]["headers"]
+    assert payload["request"]["headers"]["X-Api-Key"]
+
+
 # --- Reasoning-only response tests (fix for empty content retry loop) ---
 
 
