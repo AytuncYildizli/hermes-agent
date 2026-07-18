@@ -45,6 +45,12 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = MagicMock()
+    # These tests bypass __init__ and exercise formatting/chunking only.  The
+    # authenticated bridge-header boundary has dedicated tests, so keep this
+    # fixture from trying to read a capability through the MagicMock path.
+    adapter._bridge_request_headers = MagicMock(
+        return_value={"Authorization": "Bearer test-bridge-token"}
+    )
     adapter._mention_patterns = []
     adapter._dm_policy = "open"
     adapter._allow_from = set()
