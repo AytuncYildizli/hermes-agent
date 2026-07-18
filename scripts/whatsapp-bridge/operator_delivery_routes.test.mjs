@@ -156,3 +156,49 @@ test('disconnects, ambiguous sends, and provider id conflicts fail closed', asyn
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('route reserves durable authority before an early substituted-id echo', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-operator-routes-'));
+  try {
+    const request = sendRequest();
+    const app = fakeApp();
+    const store = createOperatorDeliveryStore(directory);
+    const providerMessageId = '3EB0EARLYROUTEECHO1';
+    registerOperatorDeliveryRoutes({
+      app,
+      store,
+      isConnected: () => true,
+      sendOperatorMessage: async () => {
+        assert.equal(store.receipt(queryFrom(request)).status, 'UNKNOWN');
+        assert.equal(store.confirmProviderEcho({
+          messageId: providerMessageId,
+          chatId: request.chat_id,
+          fromMe: true,
+          body: request.message,
+        }), false);
+        return {
+          key: {
+            id: providerMessageId,
+            remoteJid: request.chat_id,
+            fromMe: true,
+          },
+        };
+      },
+    });
+
+    const response = await invoke(app.route('/operator-send'), request);
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.payload.status, 'CONFLICT');
+
+    const restarted = createOperatorDeliveryStore(directory);
+    assert.equal(restarted.confirmProviderEcho({
+      messageId: providerMessageId,
+      chatId: request.chat_id,
+      fromMe: true,
+      body: request.message,
+    }), true);
+    assert.equal(restarted.receipt(queryFrom(request)).status, 'CONFLICT');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

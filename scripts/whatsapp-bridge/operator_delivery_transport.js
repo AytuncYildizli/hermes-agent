@@ -24,6 +24,17 @@ export function createBoundedMessageStore(limit = 512) {
   return { get, remember };
 }
 
+export function isGovernedOperatorEcho(store, message) {
+  if (!store || typeof store.confirmProviderEcho !== 'function') return false;
+  const key = message?.key;
+  if (!key || typeof key.id !== 'string' || !key.id) return false;
+  return store.confirmProviderEcho({
+    messageId: key.id,
+    chatId: key.remoteJid,
+    fromMe: key.fromMe,
+  }) === true;
+}
+
 export function createOperatorMessageSender({
   messageStore,
   sendWithTimeout,
@@ -55,6 +66,9 @@ export function createOperatorMessageSender({
       },
       message: { conversation: '' },
     };
+    trackSentMessageId({
+      key: { id: messageId, remoteJid: chatId, fromMe: true },
+    });
     const sent = await sendWithTimeout(
       chatId,
       { text: message },

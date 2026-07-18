@@ -151,6 +151,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Post-authorization gateway dispatch hook. Unlike pre_gateway_dispatch,
+    # this hook is async and receives only a bounded, secret-free event dict.
+    # Returning None means normal gateway dispatch. The only handling result is
+    # exactly {"action": "handled", "response": <str>}.
+    "authenticated_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
@@ -1329,6 +1334,69 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_authenticated_gateway_dispatch(
+        self,
+        *,
+        event: Dict[str, Any],
+    ) -> tuple[bool, Optional[str]]:
+        """Invoke the authenticated gateway hook with a strict result contract.
+
+        ``(False, None)`` means no plugin handled the message. A callback may
+        consume it only by returning exactly ``{"action": "handled",
+        "response": <str>}``, which becomes ``(True, response)``.
+
+        Any other non-``None`` return, or a callback failure, fails closed as
+        ``(True, None)``. The manager stops at the first consuming or malformed
+        result so a plugin that may already have acted can never be followed by
+        normal gateway execution or another consuming plugin.
+        """
+        callbacks = self._hooks.get("authenticated_gateway_dispatch", [])
+        expected_keys = {"action", "response"}
+
+        for cb in callbacks:
+            try:
+                result = cb(event=event)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                logger.warning(
+                    "Hook 'authenticated_gateway_dispatch' callback %s raised: %s",
+                    getattr(cb, "__name__", repr(cb)),
+                    type(exc).__name__,
+                )
+                return True, None
+
+            if result is None:
+                continue
+
+            response = result.get("response") if type(result) is dict else None
+            try:
+                response_size = (
+                    len(response.encode("utf-8"))
+                    if isinstance(response, str)
+                    else 0
+                )
+            except UnicodeError:
+                response_size = 0
+            if (
+                type(result) is dict
+                and set(result) == expected_keys
+                and result.get("action") == "handled"
+                and isinstance(response, str)
+                and "\x00" not in response
+                and 1 <= response_size <= 4096
+            ):
+                return True, response
+
+            logger.warning(
+                "Hook 'authenticated_gateway_dispatch' callback %s returned "
+                "a malformed result; dropping message fail-closed",
+                getattr(cb, "__name__", repr(cb)),
+            )
+            return True, None
+
+        return False, None
+
     # -----------------------------------------------------------------------
     # Introspection
     # -----------------------------------------------------------------------
@@ -1477,6 +1545,15 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     manager = get_plugin_manager()
     manager.discover_and_load(force=force)
     return manager
+
+
+async def invoke_authenticated_gateway_dispatch(
+    *,
+    event: Dict[str, Any],
+) -> tuple[bool, Optional[str]]:
+    """Invoke the strict post-authorization gateway plugin boundary."""
+    manager = _ensure_plugins_discovered()
+    return await manager.invoke_authenticated_gateway_dispatch(event=event)
 
 
 def get_plugin_context_engine():

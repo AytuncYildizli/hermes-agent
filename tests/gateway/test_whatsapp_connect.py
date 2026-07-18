@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -47,7 +48,9 @@ def _make_adapter():
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
     adapter._bridge_script = "/tmp/test-bridge.js"
-    adapter._session_path = Path("/tmp/test-wa-session")
+    adapter._session_path = Path(
+        f"/tmp/test-wa-session-{os.getpid()}-{id(adapter)}"
+    )
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
     adapter._bridge_process = None
@@ -64,7 +67,19 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    adapter._bridge_request_headers = MagicMock(
+        return_value={"Authorization": f"Bearer {'a' * 43}"}
+    )
     return adapter
+
+
+def _private_bridge_token(session_path: Path, token: str = "a" * 43) -> Path:
+    session_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    session_path.chmod(0o700)
+    capability = session_path / "bridge-auth-token.v1"
+    capability.write_text(token + "\n", encoding="ascii")
+    capability.chmod(0o600)
+    return capability
 
 
 def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
@@ -91,7 +106,10 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     base = [
         patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
-        patch.object(Path, "mkdir", return_value=None),
+        patch(
+            "gateway.platforms.whatsapp._ensure_private_bridge_session",
+            return_value=None,
+        ),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
@@ -144,6 +162,138 @@ class TestCloseBridgeLog:
 
         assert adapter._bridge_log_fh is None
 
+
+class TestBridgeCapability:
+    def test_private_capability_is_read_at_request_time(self, tmp_path):
+        from gateway.platforms.whatsapp import WhatsAppAdapter
+
+        adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
+        adapter._session_path = tmp_path / "session"
+        capability = _private_bridge_token(adapter._session_path, "a" * 43)
+
+        assert adapter._bridge_request_headers() == {
+            "Authorization": f"Bearer {'a' * 43}"
+        }
+        capability.write_text("b" * 43 + "\n", encoding="ascii")
+        capability.chmod(0o600)
+        assert adapter._bridge_request_headers() == {
+            "Authorization": f"Bearer {'b' * 43}"
+        }
+
+    @pytest.mark.parametrize("unsafe", ["missing", "mode", "symlink"])
+    def test_missing_or_unsafe_capability_has_no_unauthenticated_fallback(
+        self,
+        tmp_path,
+        unsafe,
+    ):
+        from gateway.platforms.whatsapp import (
+            WhatsAppAdapter,
+            WhatsAppBridgeAuthError,
+        )
+
+        adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
+        adapter._session_path = tmp_path / "session"
+        adapter._session_path.mkdir(mode=0o700)
+        capability = adapter._session_path / "bridge-auth-token.v1"
+        if unsafe == "mode":
+            _private_bridge_token(adapter._session_path)
+            capability.chmod(0o644)
+        elif unsafe == "symlink":
+            outside = tmp_path / "outside"
+            outside.write_text("a" * 43 + "\n", encoding="ascii")
+            outside.chmod(0o600)
+            capability.symlink_to(outside)
+
+        with pytest.raises(
+            WhatsAppBridgeAuthError,
+            match="whatsapp_bridge_auth_capability_invalid",
+        ):
+            adapter._bridge_request_headers()
+
+    @pytest.mark.asyncio
+    async def test_send_includes_capability_header(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path / "session"
+        _private_bridge_token(adapter._session_path)
+        adapter._running = True
+        response = MagicMock(status=200)
+        response.json = AsyncMock(return_value={"messageId": "outbound-1"})
+        session = MagicMock()
+        session.post.return_value = _AsyncCM(response)
+        adapter._http_session = session
+
+        result = await adapter.send("owner-chat", "hello")
+
+        assert result.success is True
+        assert session.post.call_args.kwargs["headers"] == {
+            "Authorization": f"Bearer {'a' * 43}"
+        }
+
+    @pytest.mark.asyncio
+    async def test_existing_legacy_bridge_is_not_reused(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path / "session"
+        _private_bridge_token(adapter._session_path)
+        response = MagicMock(status=200)
+        session = MagicMock()
+        session.get.return_value = _AsyncCM(response)
+
+        assert await adapter._probe_existing_bridge(session) is None
+        assert session.get.call_count == 1
+        assert "headers" not in session.get.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_existing_authenticated_bridge_requires_local_capability_id(
+        self,
+        tmp_path,
+    ):
+        from gateway.platforms.whatsapp import _bridge_capability_id
+
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path / "session"
+        _private_bridge_token(adapter._session_path)
+        unauthenticated = MagicMock(status=401)
+        authenticated = MagicMock(status=200)
+        authenticated.json = AsyncMock(return_value={
+            "status": "connected",
+            "operatorDeliveryContract": "v1",
+            "bridgeCapabilityId": _bridge_capability_id(adapter._session_path),
+        })
+        session = MagicMock()
+        session.get.side_effect = [
+            _AsyncCM(unauthenticated),
+            _AsyncCM(authenticated),
+        ]
+
+        assert await adapter._probe_existing_bridge(session) == "connected"
+        assert session.get.call_count == 2
+        assert "headers" not in session.get.call_args_list[0].kwargs
+        assert session.get.call_args_list[1].kwargs["headers"] == {
+            "Authorization": f"Bearer {'a' * 43}"
+        }
+
+    @pytest.mark.asyncio
+    async def test_existing_bridge_with_foreign_capability_is_not_reused(
+        self,
+        tmp_path,
+    ):
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path / "session"
+        _private_bridge_token(adapter._session_path)
+        unauthenticated = MagicMock(status=401)
+        authenticated = MagicMock(status=200)
+        authenticated.json = AsyncMock(return_value={
+            "status": "connected",
+            "operatorDeliveryContract": "v1",
+            "bridgeCapabilityId": "f" * 64,
+        })
+        session = MagicMock()
+        session.get.side_effect = [
+            _AsyncCM(unauthenticated),
+            _AsyncCM(authenticated),
+        ]
+
+        assert await adapter._probe_existing_bridge(session) is None
 
 # ---------------------------------------------------------------------------
 # data variable initialization
@@ -404,7 +554,7 @@ class TestBridgeRuntimeFailure:
 
         with patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", return_value=True), \
-             patch.object(Path, "mkdir", return_value=None), \
+             patch("gateway.platforms.whatsapp._ensure_private_bridge_session"), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("subprocess.Popen", side_effect=OSError("spawn failed")), \
              patch("builtins.open", return_value=mock_fh):

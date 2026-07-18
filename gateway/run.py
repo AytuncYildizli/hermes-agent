@@ -2563,6 +2563,109 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    @staticmethod
+    def _authenticated_gateway_event(event: MessageEvent) -> Dict[str, Any]:
+        """Build the bounded, secret-free event exposed to authenticated plugins."""
+        source = event.source
+        platform = getattr(source, "platform", None)
+        message_type = getattr(event, "message_type", None)
+        timestamp = getattr(event, "timestamp", None)
+        try:
+            is_command = bool(event.is_command())
+            command = event.get_command() if is_command else None
+        except Exception:
+            is_command = False
+            command = None
+
+        return {
+            "platform": getattr(platform, "value", str(platform or "")),
+            "chat_id": getattr(source, "chat_id", None),
+            "user_id": getattr(source, "user_id", None),
+            "thread_id": getattr(source, "thread_id", None),
+            "message_id": (
+                getattr(event, "message_id", None)
+                or getattr(source, "message_id", None)
+            ),
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "timestamp": (
+                timestamp.isoformat()
+                if hasattr(timestamp, "isoformat")
+                else str(timestamp or "")
+            ),
+            "text": getattr(event, "text", "") or "",
+            "chat_type": getattr(source, "chat_type", "") or "",
+            "is_group": getattr(source, "chat_type", "") in {
+                "group",
+                "channel",
+                "thread",
+            },
+            "message_type": getattr(message_type, "value", str(message_type or "")),
+            "has_media": bool(getattr(event, "media_urls", None)),
+            "media_types": tuple(
+                str(media_type)
+                for media_type in (getattr(event, "media_types", None) or ())
+            ),
+            "is_command": is_command,
+            "command": command,
+        }
+
+    async def _dispatch_authenticated_gateway_message(
+        self,
+        event: MessageEvent,
+    ) -> bool:
+        """Run the post-auth hook and deliver its response at most once."""
+        blocked_response = (
+            "🔴 Authenticated dispatch blocked: plugin_boundary_failed"
+        )
+        try:
+            from hermes_cli.plugins import invoke_authenticated_gateway_dispatch
+
+            handled, response = await invoke_authenticated_gateway_dispatch(
+                event=self._authenticated_gateway_event(event),
+            )
+        except Exception as exc:
+            logger.warning(
+                "authenticated_gateway_dispatch invocation failed: %s",
+                type(exc).__name__,
+            )
+            handled, response = True, None
+
+        if not handled:
+            return False
+
+        if response is None:
+            response = blocked_response
+
+        if response:
+            source = event.source
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                reply_anchor = self._reply_anchor_for_event(event)
+                metadata = self._thread_metadata_for_source(source, reply_anchor)
+                try:
+                    send_with_retry = getattr(adapter, "_send_with_retry", None)
+                    if send_with_retry is not None:
+                        await send_with_retry(
+                            chat_id=source.chat_id,
+                            content=response,
+                            reply_to=reply_anchor,
+                            metadata=metadata,
+                        )
+                    else:
+                        await adapter.send(
+                            source.chat_id,
+                            response,
+                            reply_to=reply_anchor,
+                            metadata=metadata,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "authenticated_gateway_dispatch response delivery failed: %s",
+                        type(exc).__name__,
+                    )
+
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -2579,6 +2682,18 @@ class GatewayRunner:
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # BasePlatformAdapter routes slash commands and blocking control replies
+        # before this busy handler. Keep a local guard for direct callers and
+        # synthetic command events so existing control behavior never reaches
+        # the post-authorization plugin boundary.
+        if (
+            not getattr(event, "internal", False)
+            and event.message_type != MessageType.COMMAND
+            and not event.is_command()
+            and await self._dispatch_authenticated_gateway_message(event)
+        ):
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -6903,6 +7018,18 @@ class GatewayRunner:
             # topic mode and fires ten prompts doesn't get ten copies.
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
+            return None
+
+        # Authenticated, non-control user messages may be consumed by a plugin
+        # before Hermes claims the conversational session. The helper delivers
+        # the plugin response directly and returns True, so the adapter's outer
+        # response path cannot post it a second time.
+        if (
+            not is_internal
+            and not command
+            and event.message_type != MessageType.COMMAND
+            and await self._dispatch_authenticated_gateway_message(event)
+        ):
             return None
 
         # ── Claim this session before any await ───────────────────────

@@ -1,0 +1,7 @@
+name: whip_operator
+version: 0.1.0
+description: "Opt-in authenticated WhatsApp owner dispatch into Whip's replay-safe operator ingress."
+author: Aytunc Yildizli
+kind: standalone
+hooks:
+  - authenticated_gateway_dispatch

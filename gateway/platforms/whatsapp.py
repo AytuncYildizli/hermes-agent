@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -32,6 +34,118 @@ from typing import Dict, Optional, Any
 from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
+
+_BRIDGE_CAPABILITY_FILE = "bridge-auth-token.v1"
+_BRIDGE_CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_BRIDGE_CAPABILITY_DOMAIN = b"hermes.whatsapp.bridge.capability.v1\0"
+
+
+class WhatsAppBridgeAuthError(RuntimeError):
+    """Private bridge capability is missing or unsafe."""
+
+    def __init__(self, code: str = "whatsapp_bridge_auth_capability_invalid"):
+        super().__init__(code)
+        self.code = code
+
+
+def _read_bridge_bearer(session_path: Path) -> str:
+    """Read one same-UID private bearer without following links."""
+
+    capability_path = session_path / _BRIDGE_CAPABILITY_FILE
+    descriptor = -1
+    try:
+        directory = session_path.lstat()
+        visible = capability_path.lstat()
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else None
+        if (
+            stat.S_ISLNK(directory.st_mode)
+            or not stat.S_ISDIR(directory.st_mode)
+            or (current_uid is not None and directory.st_uid != current_uid)
+            or (os.name != "nt" and stat.S_IMODE(directory.st_mode) != 0o700)
+            or stat.S_ISLNK(visible.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or (current_uid is not None and visible.st_uid != current_uid)
+            or (os.name != "nt" and stat.S_IMODE(visible.st_mode) != 0o600)
+            or visible.st_nlink != 1
+            or not 1 <= visible.st_size <= 64
+        ):
+            raise WhatsAppBridgeAuthError()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(capability_path, flags)
+        opened = os.fstat(descriptor)
+        current = capability_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (current_uid is not None and opened.st_uid != current_uid)
+            or (os.name != "nt" and stat.S_IMODE(opened.st_mode) != 0o600)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino)
+            != (visible.st_dev, visible.st_ino)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise WhatsAppBridgeAuthError()
+        chunks = []
+        remaining = 65
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        final = os.fstat(descriptor)
+        if (
+            len(payload) > 64
+            or final.st_size != len(payload)
+            or (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise WhatsAppBridgeAuthError()
+        try:
+            encoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise WhatsAppBridgeAuthError() from exc
+        token = encoded[:-1] if encoded.endswith("\n") else ""
+        if encoded != f"{token}\n" or _BRIDGE_CAPABILITY_RE.fullmatch(token) is None:
+            raise WhatsAppBridgeAuthError()
+        return token
+    except WhatsAppBridgeAuthError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WhatsAppBridgeAuthError() from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _bridge_capability_id(session_path: Path) -> str:
+    token = _read_bridge_bearer(session_path)
+    return hashlib.sha256(
+        _BRIDGE_CAPABILITY_DOMAIN + token.encode("ascii")
+    ).hexdigest()
+
+
+def _ensure_private_bridge_session(session_path: Path) -> None:
+    try:
+        session_path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        metadata = session_path.lstat()
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (current_uid is not None and metadata.st_uid != current_uid)
+        ):
+            raise WhatsAppBridgeAuthError()
+        if os.name != "nt":
+            os.chmod(session_path, 0o700, follow_symlinks=False)
+            if stat.S_IMODE(session_path.lstat().st_mode) != 0o700:
+                raise WhatsAppBridgeAuthError()
+    except WhatsAppBridgeAuthError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WhatsAppBridgeAuthError() from exc
 
 
 def _kill_port_process(port: int) -> None:
@@ -289,6 +403,38 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if env_prefix is not None:
             return env_prefix.replace("\\n", "\n")
         return self.DEFAULT_REPLY_PREFIX
+
+    def _bridge_request_headers(self) -> Dict[str, str]:
+        token = _read_bridge_bearer(self._session_path)
+        return {"Authorization": f"Bearer {token}"}
+
+    async def _probe_existing_bridge(self, session: Any) -> Optional[str]:
+        """Reuse only the authenticated bridge bound to this local capability."""
+
+        import aiohttp
+
+        health_url = f"http://127.0.0.1:{self._bridge_port}/health"
+        timeout = aiohttp.ClientTimeout(total=2)
+        expected_capability_id = _bridge_capability_id(self._session_path)
+        async with session.get(health_url, timeout=timeout) as response:
+            if response.status != 401:
+                return None
+        async with session.get(
+            health_url,
+            headers=self._bridge_request_headers(),
+            timeout=timeout,
+        ) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+        if (
+            not isinstance(data, dict)
+            or data.get("operatorDeliveryContract") != "v1"
+            or data.get("bridgeCapabilityId") != expected_capability_id
+            or data.get("status") != "connected"
+        ):
+            return None
+        return "connected"
 
     def _outgoing_chunk_limit(self) -> int:
         """Reserve room for the bridge-side prefix so final WhatsApp text fits."""
@@ -571,29 +717,22 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     print(f"[{self.name}] Failed to install dependencies: {e}")
                     return False
 
-            # Ensure session directory exists
-            self._session_path.mkdir(parents=True, exist_ok=True)
+            # The bearer and governed receipt stores both require a private
+            # same-UID session authority directory.
+            _ensure_private_bridge_session(self._session_path)
             
             # Check if bridge is already running and connected
             import aiohttp
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"http://127.0.0.1:{self._bridge_port}/health",
-                        timeout=aiohttp.ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            bridge_status = data.get("status", "unknown")
-                            if bridge_status == "connected":
-                                print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                self._mark_connected()
-                                self._bridge_process = None  # Not managed by us
-                                self._http_session = aiohttp.ClientSession()
-                                self._poll_task = asyncio.create_task(self._poll_messages())
-                                return True
-                            else:
-                                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+                    bridge_status = await self._probe_existing_bridge(session)
+                    if bridge_status == "connected":
+                        print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                        self._mark_connected()
+                        self._bridge_process = None  # Not managed by us
+                        self._http_session = aiohttp.ClientSession()
+                        self._poll_task = asyncio.create_task(self._poll_messages())
+                        return True
             except Exception:
                 pass  # Bridge not running, start a new one
             
@@ -649,6 +788,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     async with aiohttp.ClientSession() as session:
                         async with session.get(
                             f"http://127.0.0.1:{self._bridge_port}/health",
+                            headers=self._bridge_request_headers(),
                             timeout=aiohttp.ClientTimeout(total=2)
                         ) as resp:
                             if resp.status == 200:
@@ -681,6 +821,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         async with aiohttp.ClientSession() as session:
                             async with session.get(
                                 f"http://127.0.0.1:{self._bridge_port}/health",
+                                headers=self._bridge_request_headers(),
                                 timeout=aiohttp.ClientTimeout(total=2)
                             ) as resp:
                                 if resp.status == 200:
@@ -906,6 +1047,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
                     json=payload,
+                    headers=self._bridge_request_headers(),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status == 200:
@@ -949,6 +1091,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     "messageId": message_id,
                     "message": content,
                 },
+                headers=self._bridge_request_headers(),
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
@@ -992,6 +1135,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-media",
                 json=payload,
+                headers=self._bridge_request_headers(),
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status == 200:
@@ -1086,6 +1230,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/typing",
                 json={"chatId": chat_id},
+                headers=self._bridge_request_headers(),
                 timeout=aiohttp.ClientTimeout(total=5)
             ):
                 pass
@@ -1104,6 +1249,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
             async with self._http_session.get(
                 f"http://127.0.0.1:{self._bridge_port}/chat/{chat_id}",
+                headers=self._bridge_request_headers(),
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status == 200:
@@ -1132,6 +1278,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             try:
                 async with self._http_session.get(
                     f"http://127.0.0.1:{self._bridge_port}/messages",
+                    headers=self._bridge_request_headers(),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status == 200:
