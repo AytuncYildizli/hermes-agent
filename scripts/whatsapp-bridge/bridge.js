@@ -8,6 +8,8 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /operator-send  - Idempotent governed final delivery
+ *   POST /operator-receipt - Query governed final delivery receipt
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
@@ -29,6 +31,18 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import {
+  createBridgeAuthMiddleware,
+  createLoopbackHostMiddleware,
+  loadOrCreateBridgeCapability,
+} from './bridge_auth.js';
+import { createOperatorDeliveryStore } from './operator_delivery_receipts.js';
+import { registerOperatorDeliveryRoutes } from './operator_delivery_routes.js';
+import {
+  createBoundedMessageStore,
+  createOperatorMessageSender,
+  isGovernedOperatorEcho,
+} from './operator_delivery_transport.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -67,7 +81,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -75,7 +89,7 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
       timeoutMs,
     );
   });
-  return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
     .finally(() => clearTimeout(timer));
 }
 
@@ -146,7 +160,15 @@ function getContextInfo(messageContent) {
   return {};
 }
 
-mkdirSync(SESSION_DIR, { recursive: true });
+mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+const bridgeCapability = loadOrCreateBridgeCapability(SESSION_DIR);
+const operatorDeliveryStore = createOperatorDeliveryStore(SESSION_DIR);
+const messageStore = createBoundedMessageStore(512);
+const sendOperatorMessage = createOperatorMessageSender({
+  messageStore,
+  sendWithTimeout,
+  trackSentMessageId,
+});
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
@@ -247,15 +269,35 @@ async function startSocket() {
     ].filter(Boolean)));
 
     for (const msg of messages) {
+      let governedOperatorEcho = false;
+      if (msg?.key?.id) {
+        try {
+          governedOperatorEcho = isGovernedOperatorEcho(operatorDeliveryStore, msg);
+        } catch {
+          console.warn('[bridge] governed delivery echo reconciliation failed');
+          if (msg.key.fromMe) continue;
+        }
+      }
+      if (governedOperatorEcho) {
+        if (WHATSAPP_DEBUG) {
+          try {
+            console.log(JSON.stringify({
+              event: 'ignored',
+              reason: 'governed_operator_echo',
+            }));
+          } catch {}
+        }
+        continue;
+      }
       if (!msg.message) continue;
+      messageStore.remember(msg);
 
       const chatId = msg.key.remoteJid;
       if (WHATSAPP_DEBUG) {
         try {
           console.log(JSON.stringify({
             event: 'upsert', type,
-            fromMe: !!msg.key.fromMe, chatId,
-            senderId: msg.key.participant || chatId,
+            fromMe: !!msg.key.fromMe,
             messageKeys: Object.keys(msg.message || {}),
           }));
         } catch {}
@@ -295,8 +337,6 @@ async function startSocket() {
             console.log(JSON.stringify({
               event: 'ignored',
               reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
             }));
           } catch {}
           continue;
@@ -306,8 +346,6 @@ async function startSocket() {
             console.log(JSON.stringify({
               event: 'ignored',
               reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
             }));
           } catch {}
           continue;
@@ -403,7 +441,7 @@ async function startSocket() {
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
         if (WHATSAPP_DEBUG) {
-          try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo', chatId, messageId: msg.key.id })); } catch {}
+          try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo' })); } catch {}
         }
         continue;
       }
@@ -412,7 +450,7 @@ async function startSocket() {
       if (!body && !hasMedia) {
         if (WHATSAPP_DEBUG) {
           try { 
-            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) })); 
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', messageKeys: Object.keys(msg.message || {}) }));
           } catch (err) {
             console.error('Failed to log empty message event:', err);
           }
@@ -450,7 +488,6 @@ async function startSocket() {
 
 // HTTP server
 const app = express();
-app.use(express.json());
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on
@@ -458,30 +495,21 @@ app.use(express.json());
 // hostname that TTL-flips to 127.0.0.1. Reject any request whose Host
 // header doesn't resolve to a loopback alias.
 // See GHSA-ppp5-vxwm-4cf7.
-const _ACCEPTED_HOST_VALUES = new Set([
-  'localhost',
-  '127.0.0.1',
-  '[::1]',
-  '::1',
-]);
+app.use(createLoopbackHostMiddleware());
 
-app.use((req, res, next) => {
-  const raw = (req.headers.host || '').trim();
-  if (!raw) {
-    return res.status(400).json({ error: 'Missing Host header' });
-  }
-  // Strip port suffix: "localhost:3000" → "localhost"
-  const hostOnly = (raw.includes(':')
-    ? raw.substring(0, raw.lastIndexOf(':'))
-    : raw
-  ).replace(/^\[|\]$/g, '').toLowerCase();
-  if (!_ACCEPTED_HOST_VALUES.has(hostOnly)) {
-    return res.status(400).json({
-      error: 'Invalid Host header. Bridge accepts loopback hosts only.',
-    });
-  }
-  next();
-});
+// Loopback is not an authorization boundary. Require the same private
+// runtime capability for every endpoint, including health and polling.
+app.use(createBridgeAuthMiddleware(bridgeCapability));
+app.use(express.json());
+
+if (operatorDeliveryStore) {
+  registerOperatorDeliveryRoutes({
+    app,
+    store: operatorDeliveryStore,
+    isConnected: () => Boolean(sock) && connectionState === 'connected',
+    sendOperatorMessage,
+  });
+}
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
@@ -698,8 +726,8 @@ app.get('/chat/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
-    queueLength: messageQueue.length,
-    uptime: process.uptime(),
+    bridgeCapabilityId: bridgeCapability.capabilityId,
+    ...(operatorDeliveryStore ? { operatorDeliveryContract: 'v1' } : {}),
   });
 });
 
@@ -715,7 +743,7 @@ if (PAIR_ONLY) {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+      console.log(`🔒 WhatsApp allowlist configured (${ALLOWED_USERS.size} entries).`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else {

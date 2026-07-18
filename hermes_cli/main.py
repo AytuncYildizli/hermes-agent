@@ -1649,7 +1649,18 @@ def cmd_whatsapp(args):
 
     # ── Step 5: Check for existing session ───────────────────────────────
     session_dir = get_hermes_home() / "whatsapp" / "session"
-    session_dir.mkdir(parents=True, exist_ok=True)
+    session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        session_metadata = session_dir.lstat()
+        if session_dir.is_symlink() or not session_dir.is_dir():
+            raise OSError("unsafe WhatsApp session directory")
+        if hasattr(os, "geteuid") and session_metadata.st_uid != os.geteuid():
+            raise OSError("WhatsApp session owner mismatch")
+        if os.name != "nt":
+            os.chmod(session_dir, 0o700, follow_symlinks=False)
+    except OSError:
+        print("  ✗ WhatsApp session directory is unsafe; refusing to pair")
+        return
 
     if (session_dir / "creds.json").exists():
         print("✓ Existing WhatsApp session found")
@@ -1661,7 +1672,9 @@ def cmd_whatsapp(args):
             response = "n"
         if response.lower() in {"y", "yes"}:
             shutil.rmtree(session_dir, ignore_errors=True)
-            session_dir.mkdir(parents=True, exist_ok=True)
+            session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                os.chmod(session_dir, 0o700, follow_symlinks=False)
             print("  ✓ Session cleared")
         else:
             # Existing pairing — ensure WHATSAPP_ENABLED reflects that.
