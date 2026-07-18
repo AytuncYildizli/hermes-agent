@@ -8,6 +8,8 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /operator-send  - Idempotent governed final delivery
+ *   POST /operator-receipt - Query governed final delivery receipt
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
@@ -29,6 +31,12 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { createOperatorDeliveryStore } from './operator_delivery_receipts.js';
+import { registerOperatorDeliveryRoutes } from './operator_delivery_routes.js';
+import {
+  createBoundedMessageStore,
+  createOperatorMessageSender,
+} from './operator_delivery_transport.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -67,7 +75,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -75,7 +83,7 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
       timeoutMs,
     );
   });
-  return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
     .finally(() => clearTimeout(timer));
 }
 
@@ -147,6 +155,18 @@ function getContextInfo(messageContent) {
 }
 
 mkdirSync(SESSION_DIR, { recursive: true });
+let operatorDeliveryStore = null;
+try {
+  operatorDeliveryStore = createOperatorDeliveryStore(SESSION_DIR);
+} catch {
+  console.warn('[bridge] governed delivery receipt store is unavailable');
+}
+const messageStore = createBoundedMessageStore(512);
+const sendOperatorMessage = createOperatorMessageSender({
+  messageStore,
+  sendWithTimeout,
+  trackSentMessageId,
+});
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
@@ -247,7 +267,19 @@ async function startSocket() {
     ].filter(Boolean)));
 
     for (const msg of messages) {
+      if (msg?.key?.id) {
+        try {
+          operatorDeliveryStore?.confirmProviderEcho({
+            messageId: msg.key.id,
+            chatId: msg.key.remoteJid,
+            fromMe: msg.key.fromMe,
+          });
+        } catch {
+          console.warn('[bridge] governed delivery echo reconciliation failed');
+        }
+      }
       if (!msg.message) continue;
+      messageStore.remember(msg);
 
       const chatId = msg.key.remoteJid;
       if (WHATSAPP_DEBUG) {
@@ -483,6 +515,15 @@ app.use((req, res, next) => {
   next();
 });
 
+if (operatorDeliveryStore) {
+  registerOperatorDeliveryRoutes({
+    app,
+    store: operatorDeliveryStore,
+    isConnected: () => Boolean(sock) && connectionState === 'connected',
+    sendOperatorMessage,
+  });
+}
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
@@ -698,6 +739,7 @@ app.get('/chat/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
+    ...(operatorDeliveryStore ? { operatorDeliveryContract: 'v1' } : {}),
     queueLength: messageQueue.length,
     uptime: process.uptime(),
   });
